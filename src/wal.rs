@@ -42,6 +42,12 @@ impl Wal {
         Ok(())
     }
 
+    /// A second handle to the current log file, so it can be fsynced without
+    /// holding whatever lock guards the Wal. Changes after `compact`.
+    pub fn sync_handle(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
     /// Replays the log into a map. Stops cleanly at a truncated tail.
     pub fn replay(path: impl AsRef<Path>) -> io::Result<HashMap<String, String>> {
         let mut map = HashMap::new();

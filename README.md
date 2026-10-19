@@ -39,8 +39,9 @@ Errors come back as `-ERR message` and the connection stays open.
 
 ```
 client ──TCP──► thread per connection ──► Store (one Mutex)
-                                            ├─ 1. append record to the WAL (+ fsync)
-                                            └─ 2. then update the HashMap
+                                            ├─ 1. append record to the WAL
+                                            ├─ 2. update the HashMap
+                                            └─ 3. wait for group commit to fsync it
 startup: replay the WAL into the HashMap
 ```
 
@@ -49,28 +50,45 @@ startup: replay the WAL into the HashMap
 - **Torn writes are expected.** If the process dies halfway through a record, replay stops cleanly at the last complete one instead of refusing to start.
 - **Compaction** rewrites the log with one `SET` per live key into a temp file, fsyncs it, then atomically renames it over the old log. A crash at any point leaves either the old log or the new one, never a mix.
 
+## Group commit
+
+fsync is slow: on this Mac it's a full flush to the physical drive, about 3 ms. Doing one per write while holding the lock caps the store at roughly 350 writes a second, however many clients you add.
+
+With group commit (the default), a write appends its record under the lock, takes a sequence number, **releases the lock**, then waits until the log is synced up to that number. The first waiter becomes the *leader*: it runs one fsync covering every record written so far, then wakes everyone it made durable. Writers that arrive mid-sync queue up for the next one, so under load **one fsync acknowledges a whole batch**.
+
+```
+writer A ─append─┐                ┌─ ack A
+writer B ─append─┼─► leader: one fsync ─┼─ ack B
+writer C ─append─┘                └─ ack C
+```
+
+A write is still only acknowledged once it's on disk. Two details the tests pin down:
+- The leader reads "how far the log is written" and "which file to sync" **under the same lock**. Otherwise a compaction swapping files in between could make it fsync the old file while claiming writes in the new one were safe.
+- If an fsync fails, every writer waiting on it gets the error. None of them is told "OK".
+
 ## Performance
 
-8 clients, each sending `SET`s and waiting for every reply, on an M-series MacBook (`examples/bench.rs`):
+Each client sends a `SET` and waits for the reply before sending the next (`examples/bench.rs`, M-series MacBook):
 
-| Mode | Throughput | Durability |
-|---|---|---|
-| default (fsync every write) | **~350 writes/s** | survives power loss |
-| `--no-sync` | **~68,000 writes/s** | survives process crashes; a power cut can lose the last few writes |
+| `--sync` | 8 clients | 32 clients | Survives power loss? |
+|---|---|---|---|
+| `each` (fsync per write) | 379 /s | 354 /s | yes |
+| **`group`** (default) | **1,148 /s** (3×) | **2,098 /s** (6×) | **yes** |
+| `none` | 69,110 /s | 75,047 /s | no (process crashes only) |
 
-The ~200× gap is the cost of waiting for the disk on every write, one writer at a time. **Group commit** (one fsync for a whole batch of concurrent writes) is the standard fix and the next thing on the roadmap.
+`each` stays flat as clients are added, because every write queues for the disk alone. `group` scales with concurrency, because more clients means bigger batches per fsync. `none` shows the remaining gap, which is pure fsync latency.
 
 ## Run it
 
 ```bash
-cargo run --release -- --addr 127.0.0.1:6380 --wal kvlite.wal   # add --no-sync for speed
-cargo test                                                       # 14 tests, including kill -9 recovery
+cargo run --release -- --addr 127.0.0.1:6380 --wal kvlite.wal   # --sync group|each|none
+cargo test                                                       # 16 tests, including kill -9 recovery
 cargo run --release --example bench -- 127.0.0.1:6380 8 2000     # throughput check
 ```
 
 ## Tests
 
-- **Unit:** WAL replay, torn-tail recovery, compaction, store reopen, protocol parsing
+- **Unit:** WAL replay, torn-tail recovery, compaction, reopen in every sync mode, protocol parsing, 16 threads under group commit, compaction racing group commit
 - **End-to-end** against the real binary over TCP:
   - writes survive `kill -9`
   - compaction survives a crash
@@ -79,7 +97,7 @@ cargo run --release --example bench -- 127.0.0.1:6380 8 2000     # throughput ch
 
 ## Roadmap
 
-- Group commit, to close the fsync throughput gap
+- ~~Group commit~~ ✓ done in v0.2
 - Automatic compaction once the log grows past a size threshold
 - A checksum per record, to catch corruption as well as truncation
 - TTLs (`SET key value EX 60`)
