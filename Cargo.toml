@@ -1,0 +1,9 @@
+[package]
+name = "kvlite"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny in-memory key-value store over TCP with a write-ahead log"
+license = "MIT"
+repository = "https://github.com/tttamannaanand/kvlite"
+
+[dependencies]
