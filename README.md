@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-000)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-std%20only-000?logo=rust&logoColor=white)
 
-A tiny in-memory key-value store over TCP, made crash-safe by a write-ahead log. Written in Rust with **zero dependencies**: just the standard library.
+A tiny key-value store over TCP: crash-safe on one machine with a write-ahead log, and **replicated across a cluster with Raft consensus**, checked by a deterministic fault-injection simulator. Written in Rust with **zero dependencies**: just the standard library.
 
 ```
 $ cargo run --release
@@ -78,11 +78,58 @@ Each client sends a `SET` and waits for the reply before sending the next (`exam
 
 `each` stays flat as clients are added, because every write queues for the disk alone. `group` scales with concurrency, because more clients means bigger batches per fsync. `none` shows the remaining gap, which is pure fsync latency.
 
+## Raft cluster
+
+Run three nodes and the data is replicated: any one can die (even with `kill -9`) and nothing acknowledged is lost.
+
+```bash
+P=1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003
+C=1=127.0.0.1:6381,2=127.0.0.1:6382,3=127.0.0.1:6383
+kvlite --cluster --id 1 --peers $P --clients $C &
+kvlite --cluster --id 2 --peers $P --clients $C &
+kvlite --cluster --id 3 --peers $P --clients $C &
+```
+
+```
+$ nc 127.0.0.1 6382        # a follower
+SET city Bengaluru
+-MOVED 127.0.0.1:6381      # go to the leader
+STATUS
++follower term=1 leader=1 commit=4 applied=4 last=4
+```
+
+- **[`raft.rs`](src/raft.rs): the algorithm as a pure state machine.** Ticks and messages go in, messages come out; no network, disk or clock inside. Leader election, log replication with fast backtracking, and the rule that leaders only commit entries from their own term.
+- **[`cluster.rs`](src/cluster.rs): the real runtime.** Peer connections that reconnect, a 50 ms ticker, and durable term, vote and log that are **fsynced before any message is sent**, so a vote or log promise survives a crash.
+- **Reads go through the log too**, so every reply is linearizable: a client never sees a value older than one it already saw.
+
+### How it's tested: a Jepsen-style simulator
+
+[`sim.rs`](src/sim.rs) runs a whole cluster in one thread from a seed, so any failure replays exactly. Each run throws a storm at it:
+
+| Fault | |
+|---|---|
+| Network | messages dropped (5%), duplicated (3%), delayed and reordered |
+| Partitions | random splits, and isolating the current leader |
+| Crashes | nodes lose all memory and restart from their persisted state |
+| Clients | 4 clients reading, writing and deleting, following redirects, timing out |
+
+Checked **after every step**: at most one leader per term, and no two nodes ever apply different entries at the same index. Checked **at the end**: the clients' history is **linearizable** ([`linear.rs`](src/linear.rs), the Wing & Gong / Lowe search used by Knossos and Porcupine), and the cluster makes progress once faults heal.
+
+**The harness has teeth.** Three classic Raft bugs are planted behind a switch, and the tests require the simulator to catch each one:
+
+| Planted bug | Caught |
+|---|---|
+| Voting without checking the candidate's log is up to date | seed 1: two different entries applied at index 107 |
+| Truncating the log on a stale, delayed message | seed 1: two different entries applied at index 147 |
+| Committing old-term entries by counting replicas (**the Raft paper's figure 8**) | seed 176: index 12 applied as `Set(k2, c2-4)` and as a no-op |
+
+The figure-8 bug taught me something: a new leader's no-op, sent in the same batch as older entries, *masks* it, because followers acknowledge both together. The simulator only found it once replication was limited to one entry per message (`max_batch: 1`) with five nodes and more crashes. There's also a scripted, step-by-step reproduction of the paper's figure in [`raft.rs`](src/raft.rs) (`figure_8_*` tests): with the bug, an entry is committed and later overwritten; without it, Raft refuses to commit it.
+
 ## Run it
 
 ```bash
 cargo run --release -- --addr 127.0.0.1:6380 --wal kvlite.wal   # --sync group|each|none
-cargo test                                                       # 16 tests, including kill -9 recovery
+cargo test --release                                             # everything, including ~210 fault-injection runs
 cargo run --release --example bench -- 127.0.0.1:6380 8 2000     # throughput check
 ```
 
@@ -94,10 +141,17 @@ cargo run --release --example bench -- 127.0.0.1:6380 8 2000     # throughput ch
   - compaction survives a crash
   - 8 concurrent clients × 100 writes lose nothing, before or after a crash
   - bad commands return errors without dropping the connection
+- **Raft:** 25 unit tests, figure-8 reproduction, codec round trips and torn-write recovery
+- **Simulation:** 3-node, 5-node and unbatched clusters over hundreds of seeds, plus the three planted bugs
+- **Real cluster:** three processes; redirects, `kill -9` of the leader with no data loss, a restarted node catching up, and a full-cluster restart
 
 ## Roadmap
 
 - ~~Group commit~~ ✓ done in v0.2
+- ~~Raft replication~~ ✓ done in v0.3
+- Snapshots and log compaction for the Raft log
+- Membership changes (adding and removing nodes)
+- Leader leases for faster reads
 - Automatic compaction once the log grows past a size threshold
 - A checksum per record, to catch corruption as well as truncation
 - TTLs (`SET key value EX 60`)

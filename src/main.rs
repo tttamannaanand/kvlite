@@ -6,17 +6,31 @@ use kvlite::server;
 use kvlite::store::{Durability, Store};
 
 const USAGE: &str = "usage: kvlite [--addr HOST:PORT] [--wal PATH] [--sync MODE]
+       kvlite --cluster --id N --peers 1=H:P,2=H:P,3=H:P --clients 1=H:P,2=H:P,3=H:P [--data DIR]
 
   --addr  address to listen on  (default 127.0.0.1:6380)
   --wal   write-ahead log file   (default kvlite.wal)
   --sync  group   batch concurrent writes into shared fsyncs (default)
           each    fsync every write on its own (slow, for comparison)
-          none    never fsync (fast; a power cut can lose recent writes)";
+          none    never fsync (fast; a power cut can lose recent writes)
+
+cluster mode (Raft replication):
+  --id       this node's id
+  --peers    Raft address of every node, including this one
+  --clients  client address of every node (used for -MOVED redirects)
+  --data     directory for Raft state (default kvlite-data)";
 
 fn main() -> ExitCode {
     let mut addr = "127.0.0.1:6380".to_string();
     let mut wal = "kvlite.wal".to_string();
     let mut durability = Durability::Group;
+    let (mut cluster, mut id, mut peers, mut clients, mut data) = (
+        false,
+        0u64,
+        String::new(),
+        String::new(),
+        "kvlite-data".to_string(),
+    );
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -34,6 +48,11 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            "--cluster" => cluster = true,
+            "--id" => id = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--peers" => peers = args.next().unwrap_or_default(),
+            "--clients" => clients = args.next().unwrap_or_default(),
+            "--data" => data = args.next().unwrap_or_default(),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -43,6 +62,10 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    }
+
+    if cluster {
+        return run_cluster(id, &peers, &clients, &data);
     }
 
     let store = match Store::open(&wal, durability) {
@@ -74,4 +97,41 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_cluster(id: u64, peers: &str, clients: &str, data: &str) -> ExitCode {
+    let parsed = kvlite::cluster::parse_addrs(peers)
+        .and_then(|p| Ok((p, kvlite::cluster::parse_addrs(clients)?)));
+    let (peers, clients) = match parsed {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}\n\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !peers.contains_key(&id) || !clients.contains_key(&id) {
+        eprintln!("--id {id} must appear in both --peers and --clients\n\n{USAGE}");
+        return ExitCode::FAILURE;
+    }
+    let cfg = kvlite::cluster::ClusterConfig {
+        id,
+        peers,
+        clients: clients.clone(),
+        data_dir: data.into(),
+        tick: std::time::Duration::from_millis(50),
+    };
+    let node = match kvlite::cluster::Node::start(cfg) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("could not start node {id}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Tests read this line to know the node is up.
+    println!("kvlite node {id} ready, clients on {}", clients[&id]);
+    if let Err(e) = node.serve_clients() {
+        eprintln!("client server error: {e}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
