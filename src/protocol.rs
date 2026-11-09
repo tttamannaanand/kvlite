@@ -79,6 +79,26 @@ mod tests {
     }
 
     #[test]
+    fn set_strips_line_ending_from_value() {
+        assert_eq!(
+            parse("SET k v with spaces\r\n"),
+            Ok(Command::Set("k".into(), "v with spaces".into()))
+        );
+    }
+
+    #[test]
+    fn get_and_del_use_only_the_first_token_as_key() {
+        assert_eq!(parse("GET a b"), Ok(Command::Get("a".into())));
+        assert_eq!(parse("DEL a b"), Ok(Command::Del("a".into())));
+    }
+
+    #[test]
+    fn extra_leading_space_means_a_missing_key() {
+        assert_eq!(parse("GET  k"), Err("usage: GET key".into()));
+        assert_eq!(parse("SET  k v"), Err("usage: SET key value".into()));
+    }
+
+    #[test]
     fn rejects_bad_input() {
         assert!(parse("").is_err());
         assert!(parse("GET").is_err());
