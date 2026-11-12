@@ -105,4 +105,21 @@ mod tests {
         assert!(parse("SET onlykey").is_err());
         assert_eq!(parse("FLY away"), Err("unknown command 'FLY'".into()));
     }
+
+    #[test]
+    fn argless_commands_ignore_trailing_arguments() {
+        assert_eq!(parse("PING please"), Ok(Command::Ping));
+        assert_eq!(parse("len now"), Ok(Command::Len));
+    }
+
+    #[test]
+    fn blank_lines_are_empty_commands() {
+        assert_eq!(parse("\r\n"), Err("empty command".into()));
+        assert_eq!(parse("   "), Err("empty command".into()));
+    }
+
+    #[test]
+    fn unknown_command_error_is_uppercased() {
+        assert_eq!(parse("fly away"), Err("unknown command 'FLY'".into()));
+    }
 }
